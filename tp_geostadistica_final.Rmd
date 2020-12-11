@@ -1,0 +1,950 @@
+---
+title: "Geoestadística"
+subtitle: "Posgrado en Big Data e Inteligencia Territorial (FLACSO)"
+author: "Paula Videla"
+date: "Diciembre 2020"
+output: html_document
+
+---
+
+## **¿Cómo se explican los precios de la vivienda en San Isidro?**
+  
+  
+En el trabajo del [módulo anterior](https://rpubs.com/paulavidela/tpgeo), se analizaron los precios de las viviendas en el [Partido de San Isidro](https://en.wikipedia.org/wiki/San_Isidro,_Buenos_Aires) con el fin deteminar las condicionantes que lo modifican.  Se observó que variables como la superficie o la cantidad de ambientes afectaban el valor del precio de las viviendas.   
+  
+El objetivo del presente trabajo es determinar si existe dependencia espacial en los precios de las viviendas. 
+  
+  
+Librerías a utilizar: 
+
+```{r,  message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(readxl)
+library(sf)
+library(sp)
+library(ggmap)
+require(osmdata) 
+require(leaflet)
+library(rgdal)
+library(writexl)
+library(kableExtra)
+require(spatialreg)
+library(scales)
+library(jtools)
+library(osmdata)
+library(gstat)
+library(tmap)
+library(spdep)
+library(spatstat)
+library(spgwr)
+options(scipen=1000000)
+
+```
+&nbsp;
+&nbsp;
+
+
+
+
+Para tener continuidad con el trabajo anterior, se utiliza la misma base de datos, es decir los datos de [Properati](http://properati.com.ar/data) descargados el día 19/06/2020. 
+  
+  
+Se carga la base de datos, incluyendo la variable de zonificación incorporada en el trabajo anterior.
+
+
+
+```{r}
+prop_si_geo_zona <- read_sf("prop_si_geo_zona.geojson") 
+```
+
+
+### 1. VALORES DEL SUELO
+&nbsp;
+
+En primer lugar, se busca evaluar el mapa de gradientes de precio en el partido de San Isidro. Para esto, se consideran a las propiepades como observaciones representativas de la zona.   
+A fin de estandarizar los precios, se busca generar un mapa de valor del m2.   
+  
+Se considerará la superficie total como indicadora del precio: `surface_total`. En caso de esta variable sea `NA`, se tomará la superficie total: `surface_covered`.  
+Se descartan las propiedades sin m2, sin precio o con un metraje inferior a las 20m2 (se asume que no se trataría de una vivienda).
+
+
+```{r}
+prop_si_geo_zona <- prop_si_geo_zona %>% 
+  mutate(m2 = ifelse(!is.na(surface_covered), surface_covered, surface_total)) %>%
+  filter(!is.na(m2) & m2> 20 & !is.na(price)) %>%
+  mutate(usd_m2 = price / m2)
+
+```
+
+  
+  
+¿Cómo se distribuye el valor del m2 de las propiedades en San Isidro? 
+
+```{r}
+prop_si_geo_zona %>% 
+  ggplot(aes(x = property_type, y = usd_m2)) +
+  geom_boxplot() + 
+  geom_text(data= prop_si_geo_zona %>% filter(usd_m2 > 10000), 
+            aes(label = round(usd_m2,2)), nudge_y = 1000) + 
+  labs(title = "Distribución del valor del m2 en San Isidro", 
+       subtitle = "Según el tipo de propiedad en venta", 
+       x = "Tipo de propiedad", 
+       y = "USD/m2", 
+       caption = "Fuente: Elaboración propia con datos de Properati") +
+  theme_minimal()
+  
+```
+
+Se observan 3 claros **outliers**. Valores de de 33030.2USD/m2, 24904.21 USD/m2 y 11000 USD/m2 parecerían ser errores, ya implicaría valores muy superiores al [valor promedio del barrio más caro de Capital Federal](https://www.clarin.com/ciudades/precio-dolares-metro-cuadrado-propiedades-8-ciudad_0_zUDP1PS3.html).  
+Además estos valores superan considerablemente los valores de la muestra. Se remueve entonces estos outliers de la muestra.
+
+
+```{r}
+prop_si_geo_zona <- prop_si_geo_zona %>% 
+  filter(usd_m2 <=10000)
+```
+
+Descartado esos outliers, ¿cómo queda entonces la distribución de los precios? 
+
+
+```{r}
+prop_si_geo_zona %>% 
+  ggplot(aes(x = property_type, y = usd_m2)) +
+  geom_boxplot() + 
+  geom_text(data= prop_si_geo_zona %>% filter(usd_m2 < 200), 
+            aes(label = round(usd_m2,2)), nudge_y = 100) + 
+  labs(title = "Distribución del valor del m2 en San Isidro", 
+       subtitle = "Según el tipo de propiedad en venta", 
+       x = "Tipo de propiedad", 
+       y = "USD/m2", 
+       caption = "Fuente: Elaboración propia con datos de Properati") +
+  theme_minimal()
+```
+
+Hay dos valores que nuevamente parecerían no ser correctos. Es muy poco probable que el valor del m2 se comercialice a menos de 100 usd_m2.   
+Se remueven también esas dos observaciones. 
+
+```{r}
+prop_si_geo_zona <- prop_si_geo_zona %>% 
+  filter(usd_m2 >=100)
+```
+
+
+
+¿Cómo queda entonces el gradiente de precios del m2 en el partido de San Isidro? 
+
+  
+```{r}
+limites_si <- getbb("Partido de San Isidro, Buenos Aires", format_out = "sf_polygon")
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = limites_si, alpha = 0.5 ) + 
+  geom_sf(data = prop_si_geo_zona, aes(color=round(usd_m2,2))) +
+  scale_color_viridis_c(direction = -1) + 
+     labs(title = "Valor del m2 en propiedades residenciales en venta",
+         subtitle = paste0("Propiedades publicadas entre: ", 
+                           min(ymd(prop_si_geo_zona$created_on)),
+                           " y ",  max(ymd(prop_si_geo_zona$created_on))), 
+         caption= "Fuente: Properati 2020",
+         y="",
+         x="", 
+         color= "USD/m2") + 
+
+  theme_void()
+```
+
+
+Para generar mayor contraste de los valores más bajos, se lo transforma en escala logaritmica.
+
+```{r}
+ggplot() +
+  geom_sf(data = limites_si, alpha = 0.5 ) + 
+  geom_sf(data = prop_si_geo_zona, aes(color=round(usd_m2,1))) +
+  scale_color_viridis_c(trans="log", direction = -1, breaks = c(0, 1000,3000,8000)) + 
+     labs(title = "Valor del m2 en propiedades residenciales en venta",
+         subtitle = paste0("Propiedades publicadas entre: ", 
+                           min(ymd(prop_si_geo_zona$created_on)),
+                           " y ",  max(ymd(prop_si_geo_zona$created_on))), 
+         caption= "Fuente: Properati 2020",
+         y="",
+         x="", 
+         color = "USD/m2") + 
+
+  theme_void()
+```
+
+
+Si bien no es posible apreciar la concentración de precios altos o precios bajos (hot/cold spot), se observan precios más altos hacia el río y más bajos en la zona de Boulogne.   
+  &nbsp;
+  
+  
+  
+### 2. INTERPOLACIÓN DE VALORES DEL SUELO
+    
+    
+  
+#### Polígonos de Voronoi
+
+```{r}
+voronoi <- prop_si_geo_zona %>% 
+          st_geometry() %>%
+          st_union() %>%
+          st_voronoi() %>%
+          st_collection_extract()%>%
+          st_sfc(crs = st_crs(prop_si_geo_zona)) %>% 
+          st_sf() %>% 
+          st_join(prop_si_geo_zona ) %>%
+          st_intersection(limites_si)
+```
+
+
+```{r}
+qtm(voronoi, fill="usd_m2", fill.palette="-viridis", fill.breaks=seq(0,9000,1500))+
+  qtm(limites_si,  fill=NULL)
+```
+
+Se aplica una transformación logarítmica a fin de evaluar variaciones en precios más bajos.
+
+
+```{r}
+ggplot() +
+  geom_sf(data = limites_si, alpha = 0.5 ) + 
+  geom_sf(data = voronoi, aes(fill=round(usd_m2,1)), color = NA) +
+  scale_fill_viridis_c(trans="log", direction = -1, breaks = c(0, 1000,3000,8000)) + 
+     labs(title = "Valor del m2 en propiedades residenciales en venta",
+         caption= "Fuente: Properati 2020",
+         y="",
+         x="", 
+         fill = "USD/m2") + 
+
+  theme_void()
+```
+
+A partir de la interpolación espacial mediante polígonos de Voronoi, se observan ciertas áreas donde se concentran precios más altos, y otras con precios más bajos.
+  
+  
+
+#### Precios de las propiedades residenciales 
+
+A los efectos de evaluar como se construye el precio de la vivienda, solo se tendrán en cuanta los datos de venta en USD de inmuebles con destino residencial.
+&nbsp;
+
+Considerando que posteriormente la localización geográfica será utilizada, también se filtran las observaciones que no tienen coordenadas geográficas. Se convierten las variables a `sf`. 
+
+Al no contar con una grilla de puntos, o la geometría de todas las parcelas de San Isidro, no se utilizarán los métodos de **Distancia Inversa Ponderada (IDW)** ni **Kriging** para interpolar el valor del m2 (no se cuenta con geometrías donde realizar las predicciones.)
+  
+  &nbsp;
+  
+  
+  
+### 3. DATOS AGRUPADOS EN UNIDADES AREALES. 
+  &nbsp;
+  &nbsp;
+  
+  
+  
+A fin de agrupar los datos en unidades areales, y considerando que el municipio de San Isidro cuenta con pocos [datos abiertos geográficos](http://datos.sanisidro.gob.ar/), se tomaran las geometrías de los radios censales, disponibles en [Indec](https://www.indec.gob.ar/indec/web/Institucional-Indec-Codgeo).   
+Se prepara un geojson de radios censales solo en San Isidro a partir de los radios censales de Buenos Aires: 
+censo_si <- censo %>%  
+  mutate(dentro_si = st_intersects(st_centroid(censo), limites_si, sparse = FALSE)) %>%  
+  filter(dentro_si == TRUE) %>%  
+  select(-dentro_si)  
+
+
+```{r}
+censo_si <- read_sf( "censo_si.geojson")
+```
+
+```{r}
+ggplot() + geom_sf(data = limites_si) + geom_sf(data = censo_si)+ theme_minimal()
+```
+
+
+Se asigna a cada propiedad el Id del radio censal. 
+
+```{r}
+prop_si_censo <- prop_si_geo_zona %>% 
+   mutate(ID_censo = as.numeric(st_intersects(prop_si_geo_zona, censo_si)))
+  
+```
+
+```{r}
+censo_si <- censo_si %>%
+  mutate(ID_censo = row_number())
+
+censo_mean_prop <- left_join(censo_si, 
+                             prop_si_censo %>%
+                               st_set_geometry(NULL) %>%
+                               group_by(ID_censo) %>%
+                               summarise(usd_m2_z = round(mean(usd_m2),2)))
+```
+
+```{r}
+ggplot() + 
+  geom_sf(data = censo_mean_prop, aes(fill = usd_m2_z), color = NA)+
+  scale_fill_viridis_c(direction = -1)  +
+       labs(title = "Valor promedio del m2 por radio censal",
+         caption= "Fuente: Properati 2020 + INDEC",
+         y="",
+         x="", 
+         fill = "USD/m2") + 
+  theme_void()
+```
+
+```{r}
+tmap_mode("view")
+qtm(censo_mean_prop, fill = "usd_m2_z", fill.palette="-viridis")
+```
+
+
+Este este gráfico se observan concentraciones de valores más alto en la próximidad al río. A continuación se evaluará correlación espacial de las unidades areales. También se pueden visualizar unos clusters de valores más elevados, a primera vista próximos a las estaciones Martínez y San Isidro del Tren Mitre.  
+  
+
+Se observan unidades areales sin valor por m2. Se remueven estas áreas. 
+
+```{r}
+censo_mean_prop <- censo_mean_prop %>%
+  filter(!is.na(usd_m2_z))
+```
+
+Con esta distribución areal, se busca determinar si hay autocorrelación espacial.   
+  
+  
+#### Vecinos
+
+```{r}
+vecinos <- poly2nb(censo_mean_prop, row.names = "ID_censo")
+summary(vecinos)
+```
+
+
+```{r}
+plot(st_geometry(censo_mean_prop), border="grey")
+plot(vecinos, coordinates(as(censo_mean_prop, "Spatial")), add=TRUE, col="dodgerblue4")
+```
+
+
+Se arma una lista de vecinos (binarios): 
+
+```{r}
+lvb <-  nb2listw(vecinos, style='B')
+```
+  
+  
+A continuación se calculan distintos estadísticos: 
+
+1. Moran I Global
+```{r}
+moran.test(censo_mean_prop$usd_m2_z, lvb)
+```
+
+El resultado obtenido es altamente significativo. No podría descartarse la hipótesis de no existe autocorrelación espacial en los precios del suelo.   
+Se obtiene un I Moran de 0.61, lo que significaría una autocorrelación espacial positiva. 
+  
+  
+Correlograma de Morán 
+
+```{r}
+Icorr <-sp.correlogram(neighbours=vecinos,
+                       var=censo_mean_prop$usd_m2_z,
+                       order=5,method="I",zero.policy=TRUE)
+plot(Icorr)
+```
+
+Se observa siempre correlación positiva, que es mayor cuanto menor sea el orden/lag. 
+  
+  
+Diagrama de disperción
+
+```{r, message= FALSE}
+mp <- moran.plot(censo_mean_prop$usd_m2_z, lvb, zero.policy=TRUE)
+mp
+```
+
+La pendiente de la recta es el I de Moran.   
+  
+  
+2. C de Geary Global
+
+```{r}
+geary.test(censo_mean_prop$usd_m2_z, lvb)
+```
+
+El C de Geary es inferior a 1, y relativamente próximo a 0. Esto indica autocorrelación espacial positiva, y un patrón agrupado (cluster)
+
+```{r}
+IcorrC <-sp.correlogram(neighbours=vecinos,
+                       var=censo_mean_prop$usd_m2_z,
+                       order=5,method="C",zero.policy=TRUE)
+plot(IcorrC)
+```
+
+El correlograma de C de Geary global reitera lo observado para el I Moran Global. A nivel global, los valores del m2 tienen vecinos con valores similares.  
+  
+  
+  
+3. Moran local Ii  
+  
+Este indicador permite desagregar los resultados espacialmente.   
+
+```{r}
+censo_prop_lm <- localmoran(censo_mean_prop$usd_m2_z, lvb)
+head(censo_prop_lm)
+```
+
+  
+  
+Con el fin de mapear los datos, se agregan los resultados a las geometrías de los radios censales. 
+
+```{r}
+moran_map <- cbind(censo_mean_prop, censo_prop_lm)
+head(moran_map)
+```
+
+¿Cuál son los valores máximos y mínimos (dominio) del Ii de Moran? 
+
+```{r}
+max(moran_map$Ii)
+```
+
+```{r}
+min(moran_map$Ii)
+```
+
+Se renombra la variable `Pr.z...0.`
+
+```{r}
+moran_map <- moran_map %>%
+  rename(p = Pr.z...0.)
+```
+
+Se arman cuadrantes para los LISA clusters (con autocorrelación positiva) con el fin de identificar los hotspots. Previamente, se estandarizan los valores. 
+
+```{r}
+z_usd_m2 <- moran_map$usd_m2_z - mean(moran_map$usd_m2_z) 
+
+lag_usd_m2 <- lag.listw(lvb, moran_map$usd_m2_z)
+z_lag_usd_m2 <-lag_usd_m2 - mean(lag_usd_m2) 
+```
+
+
+```{r}
+quad <- vector(mode="numeric",length=nrow(moran_map))
+quad[z_usd_m2 > 0 & z_lag_usd_m2 > 0] <- 1 #alto-alto HH rojo
+quad[z_usd_m2 > 0 & z_lag_usd_m2 < 0] <- 2 #alto-bajo HL rosado
+quad[z_usd_m2 < 0 & z_lag_usd_m2 > 0] <- 3 #bajo-alto LH celeste
+quad[z_usd_m2 < 0 & z_lag_usd_m2 < 0] <- 4 #bajo-bajo LL azul
+quad[moran_map$p > 0.05] <- 5 #No Signif blanco
+```
+
+```{r}
+moran_map$quad <- quad
+```
+
+```{r}
+LISA <- c("red", "lightpink","skyblue2","blue", "white")
+```
+
+
+```{r}
+tm_shape(moran_map) + 
+tm_fill(col="quad", palette = LISA,  style = "fixed", breaks = c(1,2,3,4,5,6),
+              labels = c("HH", "LH", "HL","LL", "no signif"),title="Agrupamientos LISA") +
+tm_legend(outside=TRUE)+
+tm_borders(col = "Grey")
+```
+
+Este mapa demuestra la alta correlación espacial, y la presencia hotspots hacia el noreste del partido (cerca de las estaciones y del río), y coldspots hacia el suroeste del partido. 
+  
+  
+  
+  
+### 4. PATRONES DE PUNTOS  
+  
+&nbsp;  
+&nbsp;  
+
+Los datos de propiedades corresponden a **patrones de puntos**. En la sección anterior, fueron agrupados en unidades areales con un fin exploratorio. Sin embargo, correspondería analizarlos como patrones de puntos ya que cada propiedad en venta es una ocurrencia del fenómeno "venta de propiedades de vivienda".  
+Con este patrón de puntos, se busca analizar la frecuencia de ocurrencia de los eventos. Es decir: ¿las unidades en venta de vivienda están distribuidas aleatoriamente? ¿o existe una concentración espacial de unidades en venta?  
+Si bien el objetivo de este trabajo es determinar como varía el precio de las propiedades, es importante conocer como se distribuyen las propiedades en venta. 
+&nbsp;  
+&nbsp;  
+    
+    
+#### Estadísticas de primer orden
+
+```{r}
+tmap_mode("view")
+tmap_mode("plot")
+tm_shape(limites_si) + 
+  tm_fill() +
+  tm_shape(prop_si_geo_zona) +
+  tm_dots()
+```
+
+Como es necesario trabajar con coordenadas proyectadas, se modifica el crs de los dos datasets a utilizar: `prop_si_geo_zona` y `limites_si`. 
+
+```{r}
+prop_si_geo_zona_proj <- prop_si_geo_zona %>%
+  st_transform(crs = 22185) %>%
+  select(geometry)
+limites_si_proj <- limites_si %>% 
+    st_transform(crs = 22185) %>%
+  select(geometry)
+```
+
+En primer lugar, se tranforma los límites del partido en ventana. 
+
+```{r}
+ventana <-as.owin(st_geometry(limites_si_proj))
+plot(ventana)
+```
+
+
+Se transforman las observaciones en patrón de puntos. 
+
+```{r}
+ppp_prop <- as.ppp(prop_si_geo_zona_proj)
+Window(ppp_prop)<-ventana
+plot(ppp_prop)
+```
+
+Se observa una concentración de puntos en las áreas próximas a las estaciones Martinez y San Isidro del Tren Mitre, ramal Tigre. 
+
+
+```{r}
+summary(ppp_prop)
+```
+
+
+Se subdivide el partido de San Isidro en cuadrantes, y se calcula la intensidad (cantidad de unidades en venta). 
+    
+    
+&nbsp;
+
+#### Intensidad por cuadrantes y test de basado en los conteos
+
+- Se subdivide en cuadrantes y se calcula intensidad.
+- Si consideramos una significacion de 0.05, el patron de ditribución espacial, ¿es aleatorio?
+- Idealmente, para X2 el numero de conteos por cuadrado tiene que ser > 5
+(ver ayuda de quadrat.test)
+
+
+```{r}
+Qprop <- quadratcount(ppp_prop, nx = 5, ny = 5)
+plot(ppp_prop)
+plot(Qprop, add = TRUE, cex = 2)
+```
+
+
+Se observan cuadrantes con más de 700 unidades en venta y otros que rondan las 200 unidades. No parecería tratarse de un proceso aleatorio. 
+
+```{r}
+quadrat.test(Qprop, method ="MonteCarlo", nsim=50)
+```
+
+La estadística de primer orden son estadísticas globales que resumen el patrón de puntos para toda el área de estudio.  
+El alto valor de X2 (chi-cuadrado) nos dejaría suponer que no hay aleatoriedad espacial global.  
+Si bien es posible que existan efectos de borde, especialmente considerando que hay cuadrantes recortados, hay algunos cuadrantes completos con muchas menos observaciones. 
+  
+
+&nbsp;  
+&nbsp;  
+  
+#### Estadísticas de segundo orden  
+  
+  
+A continuación, se evaluará el estadístico K.
+
+```{r}
+K <- Kest(ppp_prop)
+plot(K)
+```
+
+
+
+Para el tamaño de la muestra, es muy complejo correr simulaciones. Se evaluará entonces la concentración de puntos a partir de la densidad. 
+
+```{r}
+densidad <- density(ppp_prop)
+class(densidad)
+plot(densidad, main='densidad de propiedades en venta en San Isidro')
+```
+
+
+### 5. MODELO DE REGRESIÓN ESPACIAL   
+  
+  
+Las secciones anteriores permiten determinar que el valor de las propiedades presenta una fuerte autocorrelación espacial. Además, los resultados obtenidos en el trabajo del módulo anterior demostraron que las variables consideradas no eran suficientes para explicar el precio de los inmuebles.   
+  
+A continuación y a fin de complejizar el modelo de regresión, se incorporarán otras variables espaciales como distancia a una estación del tren Mitre, distancia a una estación del tren Belgrano, distancia al rio (costa), distancia a la av. del Libertador, a la avenida Santa Fe/Centenario, a la autopista Panamericana, localidad en la que se encuentra la propiedad.
+
+
+```{r}
+arterias <- read_sf("arterias.geojson")
+localidades <- read_sf("localidades.geojson")
+estaciones <- read_sf("estaciones.geojson")
+
+```
+ 
+
+
+Se muestra la ubicación de estos dos archivos geográficos. 
+loc <- read_sf("D:/MSI/GIS/Localidades.shp") %>%
+  st_transform(crs = st_crs(limites_si)) %>%
+  st_write("localidades.geojson")
+arterias <- read_sf("D:/MSI/GIS/Arterias.shp") %>%
+  st_transform(crs = st_crs(limites_si)) %>%
+  st_write("arterias.geojson")
+
+
+```{r}
+ggplot() +
+  geom_sf(data = limites_si, alpha = 0.5 ) + 
+ geom_sf(data = prop_si_geo_zona) +
+  geom_sf(data = localidades, aes(fill = Localidad), alpha = 0.5) +
+  geom_sf(data = arterias, aes(color=nombre), size = 2) + 
+  geom_sf(data = estaciones, size = 4, aes(shape = NOL), fill="grey") +
+  scale_fill_brewer(type = "qual", palette = 2) + 
+  scale_color_brewer(type = "qual", palette = 1) +
+     labs(title = "Posible factores de influencia del valor de las propiedades",
+         caption= "Fuente: Elaboración Propia",
+         y="",
+         x="", 
+         color= "Arterias", 
+         fill = "Localidades", 
+         shape = "Estaciones de Tren") + 
+       scale_shape_manual(values = c(21,22,23), name = "Estaciones de Tren")  +
+
+  theme_void()
+
+```
+
+
+Se incorpora la variable localidad, y se calcula la distancia a las distintas arterias. 
+
+```{r}
+prop_si_modelo <- prop_si_geo_zona %>% 
+  st_join(localidades %>% select(Localidad))
+prop_si_modelo$dist_borde_costero = st_distance(prop_si_modelo, arterias[1,])
+prop_si_modelo$dist_av_lib  = st_distance(prop_si_modelo, arterias[2,])
+prop_si_modelo$dist_av_santafe  = st_distance(prop_si_modelo, arterias[3,])
+prop_si_modelo$dist_aut_pan = st_distance(prop_si_modelo, arterias[4,])
+prop_si_modelo$dist_aut_panT = st_distance(prop_si_modelo, arterias[5,])
+prop_si_modelo$dist_aut_panC = st_distance(prop_si_modelo, arterias[6,])
+
+```
+
+En cuanto a las estaciones, en primer lugar se busca cual es la estación más cercana, para luego calcular la distancia a dicha estación. 
+
+
+```{r}
+index_est <- st_nearest_feature(x = prop_si_modelo, y = estaciones)
+estacion_prox <- estaciones %>% slice(index_est)
+prop_si_modelo$dist_estacion_prox <- st_distance(x = prop_si_modelo, 
+                                              y= estacion_prox, by_element = TRUE)
+
+
+prop_si_modelo <- cbind(prop_si_modelo, estacion_prox %>% select(FNA,NOL)%>% st_set_geometry(NULL))
+
+```
+  
+  
+Otra cosa importante a tener en cuenta, es si la propiedad es nueva o a refaccionar. 
+
+```{r}
+prop_si_modelo <- prop_si_modelo %>%
+  mutate(refaccionar= ifelse(grepl(c("refaccionar"),description),"si","no"), 
+         estrenar= ifelse(grepl(c("estrenar"),description),"si","no"))
+```
+
+
+Habiendo incorporado estas variables, se realiza un modelo de regresión de mínimos cuadrados OLS. 
+Para hacer la regresión, y considerando un posterior trabajo con los residuos, se eliminan las observaciones incompletas.  
+También se eliminan las observaciones con ID duplicado.
+
+```{r}
+prop_si_modelo_ok <- prop_si_modelo %>%
+           filter(!is.na(permite_multi))  %>%
+  filter(!is.na(Localidad) & !is.na(property_type))
+prop_si_modelo_ok <- prop_si_modelo_ok[!duplicated(prop_si_modelo_ok$id), ]
+
+```
+
+Con el fin de evaluar que modelo ajusta mejor, se van a ir incorporando variables paulatinamente. En el trabajo del módulo anterior se observó una clara relación entre precio de la vivienda y superfie. Considerando esa situación, en este trabajo se busca determinar que afecta el valor del m2.   
+En primer lugar, se evalúa el efecto de la superficie total, entiendo que la diferencia entre superficie cubierta y superficie total hace referencia a si el inmueble cuenta con jardín/balcón.
+
+
+
+
+```{r}
+LM <- lm(usd_m2 ~ surface_total, prop_si_modelo_ok)
+summary(LM)
+```
+
+Si bien el resultado es estadísticamente significativo, la influencia de cada m2 adicional no cubierto, genera una disminución en el precio de -0.10 USD, y el R cuadrado es muy bajo.  
+
+¿Cuál es el efecto del tipo de propiedad? 
+
+```{r}
+table(prop_si_modelo_ok$property_type)
+```
+Como el tipo de propiedad "Casa de campo" no parecería tener a priori mucho sentido en un partido tan urbanizado como San Isidro, se quitan estas tres observaciones. 
+
+```{r}
+prop_si_modelo_ok <- prop_si_modelo_ok %>%
+  filter(property_type != "Casa de campo")
+```
+
+
+Se vuelve a realizar un modelo.
+
+```{r}
+LM <- lm(usd_m2 ~ property_type, prop_si_modelo_ok)
+summary(LM)
+```
+El tipo de propiead parece tener un efecto importante en el precio del m2. 
+  
+  
+¿Que ocurre con la zonificación? (Es decir aquella que permite o no multifamiliar)
+
+```{r}
+LM <- lm(usd_m2 ~ property_type  + permite_multi, prop_si_modelo_ok)
+summary(LM)
+```
+
+Incorporar esta variable no parece mejorar los resultados de la regresión. Además, tampoco es estadísticamente significativa. 
+Es probable además que las variables `property_type` y `permite_multi` estén relacionadas dado que el tipo de propiedad "Departamento" solo puede construirse en una zona que permita vivienda multifamiliar. 
+
+  
+¿Cómo influye la distancia al río en los precios de las viviendas? 
+
+
+```{r}
+LM <- lm(usd_m2 ~ property_type  + permite_multi + dist_borde_costero, prop_si_modelo_ok)
+summary(LM)
+```
+
+Es importante destacar que la distancia está calculada en m, es decir que por cada cuadra (100m), que el inmueble se aleja del río, el valor del m2 disminuye 11,91USD. 
+  
+  
+  
+Antes de incorporar otras variables de distancia, es necesario evaluar si se encuentran correlacionadas (despúes de todo, el borde costero, Av. del Libertador, Av. Santa Fe y Autopista Panamericana son paralelas)
+ 
+
+```{r}
+prop_si_modelo %>%
+  st_set_geometry(NULL) %>%
+  select(dist_borde_costero, dist_av_lib, dist_av_santafe, dist_aut_pan, dist_aut_panC, dist_aut_panT, dist_estacion_prox) %>%
+  cor()
+```
+
+Se puede observar que efectivamente las distancias al borde costero, la avenida del Libertador, la avenida Santa Fe - Centenario, y la autopista Panamericana, se encuentra fuertemente correlacionada. La distancia a una estación próxima es un poco más independiente.   
+En este sentido, se mantiene el modelo anterior, incorporando las distancias a una estación de tren. 
+
+
+
+```{r}
+LM <- lm(usd_m2 ~ property_type  + permite_multi + dist_borde_costero+ dist_estacion_prox,
+         prop_si_modelo_ok)
+summary(LM)
+```
+
+El modelo ajusta mejor. 
+
+¿Que ocurre con las localidades? 
+
+```{r}
+LM <- lm(usd_m2 ~ property_type  + permite_multi + dist_borde_costero+ dist_estacion_prox + Localidad,
+         prop_si_modelo_ok)
+summary(LM)
+```
+
+Si bien el R cuadrado aumenta, los valores no son tan significativos como en el modelo anterior. Cabe destacar que las localidades son bastante heterogéneas en particular Boulogne (que incluye barrios como la Horqueta y barrios de niveles socioeconómicos bajos) y Beccar (del Boating Club a la villa la Cava)
+
+¿Que pasa con las viviendas a estrenar o a refaccionar? 
+
+```{r}
+LM <- lm(usd_m2 ~ property_type  + permite_multi + dist_borde_costero+ dist_estacion_prox + estrenar + refaccionar,
+         prop_si_modelo_ok)
+summary(LM)
+```
+
+Los resultados son los esperados: una vivienda a estrenar es más cara (en este caso casi 400usd/m2) y una vivienda a refaccionar es más barata (alrededor de 165 usd/m2)
+
+```{r}
+LM <- lm(usd_m2 ~ property_type  + permite_multi + dist_borde_costero+ dist_estacion_prox + estrenar + refaccionar + Localidad, 
+         prop_si_modelo_ok)
+summary(LM)
+```
+
+En este caso, R está tomando como base la localidad de Acassuso. ¿Cambia algo si toma como base San Isidro? 
+
+```{r}
+prop_si_modelo_ok<- prop_si_modelo_ok %>%
+  mutate(localidad = as.factor(prop_si_modelo_ok$Localidad))
+prop_si_modelo <- within(prop_si_modelo_ok, localidad <- relevel(localidad, ref = "San Isidro"))
+```
+
+```{r}
+LM <- lm(usd_m2 ~ property_type  + permite_multi + dist_borde_costero+ dist_estacion_prox + estrenar + refaccionar + localidad, 
+         prop_si_modelo_ok)
+summary(LM)
+```
+
+
+¿Que tan bien ajustó el modelo?
+
+```{r}
+par(mfrow = c(2,2))
+plot(LM)
+```
+
+
+De este modelo de regresión, se observa:   
+- los residuos no son simétricos ni normales 
+- el R cuadrado es bajo (0,42)
+- hay algunos parámetros que no son significativos 
+  
+  
+¿Que ocurrió con los residuos de este modelo? 
+(Se observa que el modelo se realizó con 4532 observaciones y no las 4704 originales)
+
+```{r}
+prop_si_modelo_ok$resLM <-residuals(LM)
+```
+
+¿Donde se ubican los residuos? 
+
+```{r}
+ggplot() + 
+  geom_sf(data = limites_si) + 
+  geom_sf(data = prop_si_modelo_ok, aes(color = resLM)) + 
+  scale_color_distiller( type = "div", palette = 5) + 
+       labs(title = "Residuos Regresión",
+         y="",
+         x="", 
+         color = "Valores de los residuos") + 
+  theme_void()
+  
+```
+
+
+En principio no se observaría una concentración espacial de los residuos altos, sin embargo se observan pequeños clusters de residuos bajos.
+  
+  
+Previamente se determinó que los datos presentaban autocorrelación espacial. Se realizará entonces un modelo de regresión espacial. 
+
+Para determinar el ancho de banda (bandwidth) se utilizará un kernel adaptativo de tipo Gauss.  
+*No fue posible correr el código para un bandwidth de tipo kernel adaptativo tipo BiSquare con metodo Akaike. Aparecía el siguiente error: "Error in t(x[i, ]) %% inv.Z : non-conformable arguments "*.  
+
+En primer lugar, se intentó utilizar el método "aic", sin embargo el código tarda demasiado en correr, y de hecho no se aconseja su uso para grandes volumnes de datos según la nota en la función `[gwr.sel()](https://www.rdocumentation.org/packages/spgwr/versions/0.6-34/topics/gwr.sel): *Note: Use of method="aic" results in the creation of an n by n matrix, and should not be chosen when n is large*. 
+
+Utilizando el método "aic", con el siguiente código:   
+*bwG <- gwr.sel(usd_m2 ~ property_type  + permite_multi + dist_borde_costero+ dist_estacion_prox + estrenar + refaccionar + localidad, data= prop_si_modelo_ok, coords = coordinates(as(prop_si_modelo_ok, "Spatial")), adapt= TRUE,  method = "aic", verbose = T)*   
+Se obtiene un bwG de 0.03893299. 
+
+```{r}
+bwG <- 0.03893299
+```
+
+Sin embargo tambíen se evalúa con el metodo "cv" (default)
+
+```{r}
+bwG2 <- gwr.sel(usd_m2 ~ property_type  + permite_multi + dist_borde_costero+ dist_estacion_prox + estrenar + refaccionar + localidad, data= prop_si_modelo_ok, coords = coordinates(as(prop_si_modelo_ok, "Spatial")), adapt= TRUE,   verbose = T)
+
+```
+
+```{r}
+bwG2
+```
+
+Los valores bwG y bwG2 son similares. Se adopta bwG2
+
+Una vez obtenido el ancho de banda `bwG2`, se realiza la regresión geográficamente ponderada. 
+
+```{r}
+GWRdatos = gwr(usd_m2 ~ property_type  + permite_multi + dist_borde_costero+ dist_estacion_prox + estrenar + refaccionar + localidad, 
+               data= prop_si_modelo_ok, 
+               coords = coordinates(as(prop_si_modelo_ok, "Spatial")), 
+                adapt=bwG2)
+GWRdatos
+```
+
+
+Se convierte el objeto en un sf.
+
+```{r}
+GWRdatos_sf <- GWRdatos$SDF %>% st_as_sf(sp) %>% st_set_crs(st_crs(prop_si_modelo_ok))
+GWRdatos_sf
+```
+
+¿Cómo son los valores locales de R2? 
+
+`LM` es la función global. Se obtiene el valor de R2 ajustado
+
+```{r}
+r2 <- summary(LM)$adj.r.squared
+```
+
+A continuación, se comparan los valores obtenidos en el modelo ponderado geográficamente con la regresión global.
+
+```{r}
+GWRdatos_sf %>%
+  ggplot(aes(y =localR2, x = "identity")) +
+  geom_boxplot() + 
+  geom_jitter(alpha = 0.1, color = "blue") + 
+  geom_hline(yintercept = r2, color = "red", linetype = "dashed", size = 1.1) + 
+  labs(x = "") + 
+  theme_minimal()
+  
+```
+
+Si bien hay valores de R2 queson más altos al obtenido con la regresión global, el valor medio es levemente superiro al valor obtenido en la regresión global. Se observan ademas algunos R2 muy bajos.    
+  
+
+¿Cómo se distribuyen los residuos?
+
+```{r}
+tm_shape(GWRdatos_sf) + 
+   tm_bubbles("gwr.e") 
+```
+
+
+Para finalizar, se evalúa con otros modelos espaciales.   
+  
+En primer lugar se determina una matriz de vecinos. Se determina como "vecinos" a las 3 propiedades más próximas (también podría usarse los polígonos de Voronoi y determinar vecinos por contiguidad). 
+
+```{r}
+vecinosSI <- knn2nb(knearneigh(as_Spatial(prop_si_modelo_ok), k = 3))
+vecinosSI <- nb2listw(vecinosSI, style="W")
+
+```
+
+
+```{r}
+summary(lm.LMtests(LM, listw=vecinosSI, test="all"))
+```
+
+El pvalor es significativo para todos los tipos de test. Se utilizará a continuación una regresión espacial lagged. 
+
+```{r}
+LAGdatos <- spatialreg::lagsarlm(usd_m2 ~ property_type  + permite_multi + dist_borde_costero+ dist_estacion_prox + estrenar + refaccionar + localidad, data=prop_si_modelo_ok, vecinosSI)
+summary(LAGdatos)
+```
+El pvalor es significativo, pero aún el Rho no supera el 0.5. 
+  
+  
+  
+
+###  Conclusión
+
+Si bien se observa una mejora en las predicciones con las regresiones geograficamente ponderada y regresión espacial lag en relación a la regresión lineal, ésta es muy leve.   
+En primer lugar, hay observaciones que tienen valores de m2 demasiado elevados, y es posible que sean errores.   
+Además, el modelo podría mejorarse ya sea incorporando variables o adoptando otras potencias de las variables evaluadas (como al cuadrado o raíz cuadrada)
+ 
